@@ -13,19 +13,17 @@ add_compile_options(-O3 -Wall)
 # Executável
 add_executable(exanic-capture src/main.c)
 
-# Includes e libs (equivalente a -I../libs e -L../libs/exanic -lexanic -lrt)
-target_include_directories(exanic-capture PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../libs
+set(EXANIC_ROOT ${CMAKE_SOURCE_DIR}/libs)          # contém a pasta "exanic/"
+set(EXANIC_DIR  ${EXANIC_ROOT}/exanic)             # onde está libexanic.a
+
+# Para que "exanic/exanic.h" seja encontrado em libs/exanic/exanic.h
+target_include_directories(exanic-capture PRIVATE ${EXANIC_ROOT})
+
+# Opção A: declarar a lib estática como IMPORTED
+add_library(exanic STATIC IMPORTED GLOBAL)
+set_target_properties(exanic PROPERTIES
+  IMPORTED_LOCATION "${EXANIC_DIR}/libexanic.a"
 )
 
-# Diretório da lib exanic
-target_link_directories(exanic-capture PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../libs/exanic
-)
-
-# Vincular exanic e rt
+# Linka a lib exanic (e rt, se necessário)
 target_link_libraries(exanic-capture PRIVATE exanic rt)
-
-# Instalação (equivalente a PREFIX=/usr/local e bin dir)
-# Usa CMAKE_INSTALL_PREFIX (padrão: /usr/local). O DESTDIR pode ser usado no `cmake --install`.
-install(TARGETS exanic-capture RUNTIME DESTINATION bin)
