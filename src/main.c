@@ -376,55 +376,39 @@ static int set_promiscuous_mode(exanic_t *exanic, int port_number, int enable) {
 }
 
 static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf, size_t file_name_buf_size,
-                       file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size) {
-    /* Fechar o atual */
+                       file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size)
+{
     if (*savefp) {
         fclose(*savefp);
         *savefp = NULL;
     }
 
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-
-    char timestamp_str[32];
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", &tm_now);
-
-    char date_str[16];
-    strftime(date_str, sizeof(date_str), "%Y%m%d", &tm_now);
-
-    mkdir(date_str, 0755);
-    mkdir("temp", 0755);
-
-    /* Se já existia um arquivo anterior, mover para a pasta do dia */
-    if (file_name_buf[0] != '\0') {
-        char just_name[4096];
-        const char *base = strrchr(file_name_buf, '/');
-        snprintf(just_name, sizeof(just_name), "%s", base ? base + 1 : file_name_buf);
-
-        char final_file_path[4096];
-        snprintf(final_file_path, sizeof(final_file_path), "%s/%s", date_str, just_name);
-
-        /* Ignora erro de rename para não quebrar a captura */
-        rename(file_name_buf, final_file_path);
+    if (snprintf(file_name_buf, file_name_buf_size, "%s", savefile) >= (int)file_name_buf_size) {
+        fprintf(stderr, "Filename too long: %s\n", savefile);
+        return -1;
     }
 
-    /* Abrir novo arquivo em temp/ com timestamp */
-    snprintf(file_name_buf, file_name_buf_size, "temp/%s_%s.pcap", savefile, timestamp_str);
-    *savefp = fopen(file_name_buf, "w");
+    struct stat st;
+    int exists = (stat(file_name_buf, &st) == 0);
+    unsigned long existing_size = exists ? (unsigned long)st.st_size : 0;
+
+    const char *mode = exists ? "ab" : "wb";
+    *savefp = fopen(file_name_buf, mode);
     if (!*savefp) {
         perror(file_name_buf);
         return -1;
     }
 
-    printf("Novo arquivo criado: %s\n", file_name_buf);
+    *file_size = existing_size;
 
-    *file_size = 0;
-    if (file_format == FORMAT_PCAP)
+    if (file_format == FORMAT_PCAP && *file_size == 0) {
         *file_size = write_pcap_header(*savefp, nsec_pcap, snaplen);
+    }
 
+    printf("Usando arquivo: %s\n", file_name_buf);
     return 0;
 }
+
 
 int main(int argc, char *argv[]) {
     const char *interface = NULL;
