@@ -375,31 +375,70 @@ static int set_promiscuous_mode(exanic_t *exanic, int port_number, int enable) {
     return 0;
 }
 
+static int ensure_dir(const char *path)
+{
+    if (!path || !*path) return 0;
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        fprintf(stderr, "Path exists and is not a directory: %s\n", path);
+        return -1;
+    }
+    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
+        perror(path);
+        return -1;
+    }
+    return 0;
+}
+
+static int move_to_repo(const char *temp_path, const char *repo_dir)
+{
+    if (!temp_path || !*temp_path || !repo_dir || !*repo_dir) return 0;
+
+    const char *base = strrchr(temp_path, '/');
+    base = base ? base + 1 : temp_path;
+
+    if (ensure_dir(repo_dir) != 0) return -1;
+
+    char dst[4096];
+    if (snprintf(dst, sizeof(dst), "%s/%s", repo_dir, base) >= (int)sizeof(dst)) {
+        fprintf(stderr, "Destination path too long\n");
+        return -1;
+    }
+
+    if (rename(temp_path, dst) == -1) {
+        perror("rename (temp -> repo)");
+        return -1;
+    }
+    printf("Finalizado: %s -> %s\n", temp_path, dst);
+    return 0;
+}
+
 static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf, size_t file_name_buf_size,
                        file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size,
-                       int *file_no)
+                       int *file_no, const char *repo_dir)
 {
+
     if (*savefp) {
         fclose(*savefp);
         *savefp = NULL;
     }
 
+    if (file_name_buf[0] != '\0' && repo_dir && *repo_dir) {
+        if (move_to_repo(file_name_buf, repo_dir) != 0) {
+            fprintf(stderr, "Aviso: falha ao mover arquivo finalizado para o repo.\n");
+        }
+        file_name_buf[0] = '\0';
+    }
+
     if (file_no) *file_no += 1;
     int idx = (file_no ? *file_no : 1);
 
+    const char *temp_dir = "temp";
+    if (ensure_dir(temp_dir) != 0) return -1;
+
     const char *slash = strrchr(savefile, '/');
     const char *fname = slash ? slash + 1 : savefile;
-
-    char dir[2048] = {0};
-    if (slash) {
-        size_t dlen = (size_t)(slash - savefile) + 1;
-        if (dlen >= sizeof(dir)) {
-            fprintf(stderr, "Directory path too long\n");
-            return -1;
-        }
-        memcpy(dir, savefile, dlen);
-        dir[dlen] = '\0';
-    }
 
     const char *dot = strrchr(fname, '.');
     char base[2048], ext[32];
@@ -412,13 +451,13 @@ static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf,
         }
         memcpy(base, fname, blen);
         base[blen] = '\0';
-
         snprintf(ext, sizeof(ext), "%s", dot + 1);
     } else {
         snprintf(base, sizeof(base), "%s", fname);
         snprintf(ext, sizeof(ext), (file_format == FORMAT_ERF) ? "erf" : "pcap");
     }
-    if (snprintf(file_name_buf, file_name_buf_size, "%s%s%d.%s", dir, base, idx, ext) >= (int)file_name_buf_size) {
+
+    if (snprintf(file_name_buf, file_name_buf_size, "%s/%s%d.%s", temp_dir, base, idx, ext) >= (int)file_name_buf_size) {
         fprintf(stderr, "Filename too long\n");
         return -1;
     }
@@ -430,12 +469,11 @@ static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf,
     }
 
     *file_size = 0;
-
     if (file_format == FORMAT_PCAP) {
         *file_size = write_pcap_header(*savefp, nsec_pcap, snaplen);
     }
 
-    printf("Novo arquivo criado: %s\n", file_name_buf);
+    printf("Capturando em: %s (repo: %s)\n", file_name_buf, repo_dir ? repo_dir : ".");
     return 0;
 }
 
@@ -469,8 +507,9 @@ int main(int argc, char *argv[]) {
 
     unsigned int rotate_seconds = 0;
     time_t next_rotation_time = 0;
+    const char *repo_dir = NULL;
 
-    while ((c = getopt(argc, argv, "i:w:s:C:F:pHNG:h?")) != -1) {
+    while ((c = getopt(argc, argv, "i:w:s:C:F:pHNG:R:h?")) != -1) {
         switch (c) {
             case 'i': interface = optarg; break;
             case 'w': savefile = optarg; break;
@@ -487,6 +526,7 @@ int main(int argc, char *argv[]) {
             case 'p': promisc = 0; break;
             case 'H': hw_tstamp = 1; break;
             case 'N': nsec_pcap = 1; break;
+            case 'R': repo_dir = optarg; break;
             default: goto usage_error;
         }
     }
@@ -505,7 +545,7 @@ int main(int argc, char *argv[]) {
         } else {
             file_name_buf[0] = '\0';
             if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
-                            file_format, nsec_pcap, snaplen, &file_size, &file_no) != 0)
+                            file_format, nsec_pcap, snaplen, &file_size, &file_no, repo_dir) != 0)
                 goto err_open_savefile;
 
             if (rotate_seconds > 0) {
@@ -571,8 +611,9 @@ int main(int argc, char *argv[]) {
                     time_t now = time(NULL);
                     if (now >= next_rotation_time) {
                         if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
-                                        file_format, nsec_pcap, snaplen, &file_size, &file_no) != 0)
+                                        file_format, nsec_pcap, snaplen, &file_size, &file_no, repo_dir) != 0)
                             goto err_open_next_file;
+
 
                         next_rotation_time = now + rotate_seconds;
                     }
