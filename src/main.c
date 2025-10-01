@@ -376,36 +376,66 @@ static int set_promiscuous_mode(exanic_t *exanic, int port_number, int enable) {
 }
 
 static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf, size_t file_name_buf_size,
-                       file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size)
+                       file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size,
+                       int *file_no)
 {
     if (*savefp) {
         fclose(*savefp);
         *savefp = NULL;
     }
 
-    if (snprintf(file_name_buf, file_name_buf_size, "%s", savefile) >= (int)file_name_buf_size) {
-        fprintf(stderr, "Filename too long: %s\n", savefile);
+    if (file_no) *file_no += 1;
+    int idx = (file_no ? *file_no : 1);
+
+    const char *slash = strrchr(savefile, '/');
+    const char *fname = slash ? slash + 1 : savefile;
+
+    char dir[2048] = {0};
+    if (slash) {
+        size_t dlen = (size_t)(slash - savefile) + 1;
+        if (dlen >= sizeof(dir)) {
+            fprintf(stderr, "Directory path too long\n");
+            return -1;
+        }
+        memcpy(dir, savefile, dlen);
+        dir[dlen] = '\0';
+    }
+
+    const char *dot = strrchr(fname, '.');
+    char base[2048], ext[32];
+
+    if (dot && dot != fname) {
+        size_t blen = (size_t)(dot - fname);
+        if (blen >= sizeof(base)) {
+            fprintf(stderr, "Base filename too long\n");
+            return -1;
+        }
+        memcpy(base, fname, blen);
+        base[blen] = '\0';
+
+        snprintf(ext, sizeof(ext), "%s", dot + 1);
+    } else {
+        snprintf(base, sizeof(base), "%s", fname);
+        snprintf(ext, sizeof(ext), (file_format == FORMAT_ERF) ? "erf" : "pcap");
+    }
+    if (snprintf(file_name_buf, file_name_buf_size, "%s%s%d.%s", dir, base, idx, ext) >= (int)file_name_buf_size) {
+        fprintf(stderr, "Filename too long\n");
         return -1;
     }
 
-    struct stat st;
-    int exists = (stat(file_name_buf, &st) == 0);
-    unsigned long existing_size = exists ? (unsigned long)st.st_size : 0;
-
-    const char *mode = exists ? "ab" : "wb";
-    *savefp = fopen(file_name_buf, mode);
+    *savefp = fopen(file_name_buf, "wb");
     if (!*savefp) {
         perror(file_name_buf);
         return -1;
     }
 
-    *file_size = existing_size;
+    *file_size = 0;
 
-    if (file_format == FORMAT_PCAP && *file_size == 0) {
+    if (file_format == FORMAT_PCAP) {
         *file_size = write_pcap_header(*savefp, nsec_pcap, snaplen);
     }
 
-    printf("Usando arquivo: %s\n", file_name_buf);
+    printf("Novo arquivo criado: %s\n", file_name_buf);
     return 0;
 }
 
@@ -432,7 +462,7 @@ int main(int argc, char *argv[]) {
     unsigned long rx_success = 0, rx_aborted = 0, rx_corrupt = 0, rx_hwovfl = 0, rx_swovfl = 0, rx_other = 0;
     file_format_type file_format = FORMAT_PCAP;
 
-    int file_no = 0, monitor_file_size = 0;
+    int file_no = 0;
     unsigned long file_size = 0, file_size_limit = 0;
     char file_name_buf[4096];
     int c;
@@ -475,7 +505,7 @@ int main(int argc, char *argv[]) {
         } else {
             file_name_buf[0] = '\0';
             if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
-                            file_format, nsec_pcap, snaplen, &file_size) != 0)
+                            file_format, nsec_pcap, snaplen, &file_size, &file_no) != 0)
                 goto err_open_savefile;
 
             if (rotate_seconds > 0) {
@@ -541,7 +571,7 @@ int main(int argc, char *argv[]) {
                     time_t now = time(NULL);
                     if (now >= next_rotation_time) {
                         if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
-                                        file_format, nsec_pcap, snaplen, &file_size) != 0)
+                                        file_format, nsec_pcap, snaplen, &file_size, &file_no) != 0)
                             goto err_open_next_file;
 
                         next_rotation_time = now + rotate_seconds;
