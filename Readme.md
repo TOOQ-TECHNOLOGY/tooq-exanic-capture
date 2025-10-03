@@ -15,7 +15,9 @@ Este código é uma versão modificada do famoso [exanic-capture](https://github
 ## Comando de uso
 
 Exemplo:
+```bash
 sudo ./build/exanic-capture -i enp23s0 -G 60 -w teste -R "/mnt/var/datafix/"
+```
 
 Sendo:
 - `-i` → interface  
@@ -30,9 +32,7 @@ make modules
 make install-modules
 
 ## Demais comandos
-
-[-w savefile] [-s snaplen] [-C file_size] [-F file_format] [-p] [-H] [-N] [filter...]
-
+```bash
 - `-i` : especifica interface Linux (ex: eth0) ou porta ExaNIC (ex: exanic0:0)  
 - `-w` : salva pacotes no arquivo indicado (ou stdout com `-`)  
 - `-s` : tamanho máximo de dados a capturar  
@@ -42,7 +42,7 @@ make install-modules
 - `-H` : usa timestamps de hardware (ver documentação para sync de clock)  
 - `-N` : grava formato pcap com resolução de nanossegundos  
 - `-G` : rotaciona para novo arquivo a cada N segundos (rotação por tempo)  
-
+```
 ## OBS
 Não julguem o dev 😅 — estou sem o **Conan**.  
 Ele apresentava um erro de compatibilidade com meu kernel.  
