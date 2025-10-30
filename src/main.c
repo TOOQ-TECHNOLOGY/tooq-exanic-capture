@@ -391,92 +391,100 @@ static int ensure_dir(const char *path)
     return 0;
 }
 
-static int move_to_repo(const char *temp_path, const char *repo_dir)
-{
-    if (!temp_path || !*temp_path || !repo_dir || !*repo_dir) return 0;
+// static int move_to_repo(const char *temp_path, const char *repo_dir)
+// {
+//     if (!temp_path || !*temp_path || !repo_dir || !*repo_dir) return 0;
 
-    const char *base = strrchr(temp_path, '/');
-    base = base ? base + 1 : temp_path;
+//     const char *base = strrchr(temp_path, '/');
+//     base = base ? base + 1 : temp_path;
 
-    if (ensure_dir(repo_dir) != 0) return -1;
+//     if (ensure_dir(repo_dir) != 0) return -1;
 
-    char dst[4096];
-    if (snprintf(dst, sizeof(dst), "%s/%s", repo_dir, base) >= (int)sizeof(dst)) {
-        fprintf(stderr, "Destination path too long\n");
-        return -1;
-    }
+//     char dst[4096];
+//     if (snprintf(dst, sizeof(dst), "%s/%s", repo_dir, base) >= (int)sizeof(dst)) {
+//         fprintf(stderr, "Destination path too long\n");
+//         return -1;
+//     }
 
-    if (rename(temp_path, dst) == -1) {
-        perror("rename (temp -> repo)");
-        return -1;
-    }
-    printf("Finalizado: %s -> %s\n", temp_path, dst);
-    return 0;
+//     if (rename(temp_path, dst) == -1) {
+//         perror("rename (temp -> repo)");
+//         return -1;
+//     }
+//     printf("Finalizado: %s -> %s\n", temp_path, dst);
+//     return 0;
+// }
+
+static const char* path_basename(const char* path) {
+    const char* slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
 }
 
-static int rotate_file(FILE **savefp, const char *savefile, char *file_name_buf, size_t file_name_buf_size,
-                       file_format_type file_format, int nsec_pcap, int snaplen, unsigned long *file_size,
-                       int *file_no, const char *repo_dir)
-{
+static void path_dirname_into(const char* path, char* out, size_t out_sz) {
+    const char* slash = strrchr(path, '/');
+    if (!slash) { snprintf(out, out_sz, "."); return; }
+    size_t len = (size_t)(slash - path);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+}
 
-    if (*savefp) {
-        fclose(*savefp);
-        *savefp = NULL;
-    }
-
-    if (file_name_buf[0] != '\0' && repo_dir && *repo_dir) {
-        if (move_to_repo(file_name_buf, repo_dir) != 0) {
-            fprintf(stderr, "Aviso: falha ao mover arquivo finalizado para o repo.\n");
-        }
-        file_name_buf[0] = '\0';
-    }
-
-    if (file_no) *file_no += 1;
-    int idx = (file_no ? *file_no : 1);
-
-    const char *temp_dir = "temp";
-    if (ensure_dir(temp_dir) != 0) return -1;
-
-    const char *slash = strrchr(savefile, '/');
-    const char *fname = slash ? slash + 1 : savefile;
-
-    const char *dot = strrchr(fname, '.');
-    char base[2048], ext[32];
-
+static void split_base_ext(const char* fname, char* base, size_t base_sz, char* ext, size_t ext_sz, file_format_type fmt) {
+    const char* dot = strrchr(fname, '.');
     if (dot && dot != fname) {
         size_t blen = (size_t)(dot - fname);
-        if (blen >= sizeof(base)) {
-            fprintf(stderr, "Base filename too long\n");
-            return -1;
-        }
+        if (blen >= base_sz) blen = base_sz - 1;
         memcpy(base, fname, blen);
         base[blen] = '\0';
-        snprintf(ext, sizeof(ext), "%s", dot + 1);
+        snprintf(ext, ext_sz, "%s", dot + 1);
     } else {
-        snprintf(base, sizeof(base), "%s", fname);
-        snprintf(ext, sizeof(ext), (file_format == FORMAT_ERF) ? "erf" : "pcap");
+        snprintf(base, base_sz, "%s", fname);
+        snprintf(ext,  ext_sz,  "%s", (fmt == FORMAT_ERF) ? "erf" : "pcap");
+    }
+}
+static int rotate_file(
+    FILE **savefp,
+    const char *savefile,
+    char *file_name_buf, size_t file_name_buf_size,
+    file_format_type file_format, int nsec_pcap, int snaplen,
+    unsigned long *file_size, int *file_no,
+    const char *repo_dir
+){
+    if (*savefp) { fclose(*savefp); *savefp = NULL; }
+
+    if (file_no) *file_no += 1;
+    const int idx = (file_no ? *file_no : 1);   
+
+    char out_dir[2048];
+    if (strchr(savefile, '/'))  path_dirname_into(savefile, out_dir, sizeof(out_dir));
+    else if (repo_dir && *repo_dir) snprintf(out_dir, sizeof(out_dir), "%s", repo_dir);
+    else snprintf(out_dir, sizeof(out_dir), ".");
+
+    if (ensure_dir(out_dir) != 0) {
+        fprintf(stderr, "Falha ao garantir diretório: %s\n", out_dir);
+        return -1;
     }
 
-    if (snprintf(file_name_buf, file_name_buf_size, "%s/%s%d.%s", temp_dir, base, idx, ext) >= (int)file_name_buf_size) {
+    const char *fname = path_basename(savefile);
+    char base[2048], ext[32];
+    split_base_ext(fname, base, sizeof(base), ext, sizeof(ext), file_format);
+
+    if (snprintf(file_name_buf, file_name_buf_size, "%s/%s%d.%s", out_dir, base, idx, ext)
+        >= (int)file_name_buf_size) {
         fprintf(stderr, "Filename too long\n");
         return -1;
     }
 
     *savefp = fopen(file_name_buf, "wb");
-    if (!*savefp) {
-        perror(file_name_buf);
-        return -1;
-    }
+    if (!*savefp) { perror(file_name_buf); return -1; }
 
     *file_size = 0;
     if (file_format == FORMAT_PCAP) {
         *file_size = write_pcap_header(*savefp, nsec_pcap, snaplen);
     }
 
-    printf("Capturando em: %s (repo: %s)\n", file_name_buf, repo_dir ? repo_dir : ".");
+    printf("Capturando em: %s\n", file_name_buf);
     return 0;
 }
-
 
 int main(int argc, char *argv[]) {
     const char *interface = NULL;
