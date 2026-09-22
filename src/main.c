@@ -4,6 +4,10 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <getopt.h>
 #include <time.h>
 #include <endian.h>
 #include <net/if.h>
@@ -20,48 +24,65 @@
 #include <exanic/filter.h>
 
 #include "pcap-structures.h"
+#include "ptp_clock.h"
 
 typedef enum {
     FORMAT_PCAP = 0,
     FORMAT_ERF = 1,
 } file_format_type;
 
-volatile int run = 1;
+volatile sig_atomic_t run = 1;
+static int durable = 0;
+static struct ptp_clock ptp = {.fd = -1};
 
 void signal_handler(int signum) {
+    (void)signum;
     run = 0;
 }
 
-void create_timestamped_filename(const char *base_name, char *output_buffer, size_t buffer_size) {
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    char timestamp_str[32];
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", &tm_now);
-
-    if (snprintf(output_buffer, buffer_size, "%s_%s.pcap", base_name, timestamp_str) >= buffer_size) {
-        fprintf(stderr, "Filename too long: %s_%s.pcap\n", base_name, timestamp_str);
-        exit(1);
-    }
+static int parse_number(const char *s, unsigned long min, unsigned long max, unsigned long *out) {
+    char *end;
+    errno = 0;
+    if (!s || !isdigit((unsigned char)*s)) return -1;
+    unsigned long value = strtoul(s, &end, 10);
+    if (errno || *end || value < min || value > max) return -1;
+    *out = value;
+    return 0;
 }
+
+static int write_exact(FILE *fp, const void *data, size_t size) {
+    if (fwrite(data, 1, size, fp) != size || ferror(fp)) {
+        if (!errno) errno = EIO;
+        perror("capture write");
+        return -1;
+    }
+    return 0;
+}
+
+static int rotation_due(unsigned long size, unsigned long header, size_t record,
+                        unsigned long limit, unsigned int seconds, time_t now, time_t next) {
+    return (seconds && now >= next) ||
+           (limit && size > header && (size >= limit || record > limit - size));
+}
+
 
 /* Parses a string of the format "<device>:<port>" */
 int parse_device_port(const char *str, char *device, int *port_number) {
-    char *p, *q;
+    const char *p;
+    unsigned long value;
     p = strchr(str, ':');
     if (p == NULL) return -1;
-    if ((p-str) >= 16) return -1;
+    if (p == str || (p-str) >= 16) return -1;
     strncpy(device, str, p - str);
     device[p - str] = '\0';
-    *port_number = strtol(p + 1, &q, 10);
-    if (*(p + 1) == '\0' || *q != '\0') /* strtol failed */
-        return -1;
+    if (parse_number(p + 1, 0, INT_MAX, &value)) return -1;
+    *port_number = (int)value;
     return 0;
 }
 
 int parse_one_filter(char ***argv, int *argc, exanic_ip_filter_t *filter, int *bidir) {
     struct in_addr ip_addr;
-    char *endptr;
+    unsigned long port;
     int host_specified = 0, dst_specified = 0, src_specified = 0;
     int port_specified = 0, dport_specified = 0, sport_specified = 0;
     int proto_specified = 0;
@@ -100,8 +121,8 @@ int parse_one_filter(char ***argv, int *argc, exanic_ip_filter_t *filter, int *b
             if (dst_specified || src_specified || dport_specified || sport_specified) return 0;
             (*argv)++; (*argc)--;
             if (!*argc) return 0;
-            filter->dst_port = htons(strtoul((*argv)[0], &endptr, 0));
-            if (*endptr != 0) return 0;
+            if (parse_number((*argv)[0], 0, 65535, &port)) return 0;
+            filter->dst_port = htons((uint16_t)port);
             (*argv)++; (*argc)--;
             port_specified = 1;
         }
@@ -110,8 +131,8 @@ int parse_one_filter(char ***argv, int *argc, exanic_ip_filter_t *filter, int *b
             if (host_specified || port_specified) return 0;
             (*argv)++; (*argc)--;
             if (!*argc) return 0;
-            filter->dst_port = htons(strtoul((*argv)[0], &endptr, 0));
-            if (*endptr != 0) return 0;
+            if (parse_number((*argv)[0], 0, 65535, &port)) return 0;
+            filter->dst_port = htons((uint16_t)port);
             (*argv)++; (*argc)--;
             dport_specified = 1;
         }
@@ -120,8 +141,8 @@ int parse_one_filter(char ***argv, int *argc, exanic_ip_filter_t *filter, int *b
             if (host_specified || port_specified) return 0;
             (*argv)++; (*argc)--;
             if (!*argc) return 0;
-            filter->src_port = htons(strtoul((*argv)[0], &endptr, 0));
-            if (*endptr != 0) return 0;
+            if (parse_number((*argv)[0], 0, 65535, &port)) return 0;
+            filter->src_port = htons((uint16_t)port);
             (*argv)++; (*argc)--;
             sport_specified = 1;
         }
@@ -138,6 +159,8 @@ int parse_one_filter(char ***argv, int *argc, exanic_ip_filter_t *filter, int *b
             proto_specified = 1;
         }
         else if (strcmp((*argv)[0], "or") == 0) {
+            if (!(host_specified || dst_specified || src_specified || port_specified ||
+                  dport_specified || sport_specified || proto_specified) || *argc == 1) return 0;
             (*argv)++; (*argc)--;
             *bidir = host_specified || port_specified;
             return 1;
@@ -173,7 +196,7 @@ int apply_filters(exanic_t *exanic, exanic_rx_t *rx, char **argv, int argc) {
     return 1;
 }
 
-unsigned write_pcap_header(FILE *fp, int nsec_pcap, int snaplen) {
+int write_pcap_header(FILE *fp, int nsec_pcap, int snaplen) {
     struct pcap_file_header hdr;
     hdr.magic = nsec_pcap ? NSEC_TCPDUMP_MAGIC : TCPDUMP_MAGIC;
     hdr.version_major = PCAP_VERSION_MAJOR;
@@ -183,11 +206,11 @@ unsigned write_pcap_header(FILE *fp, int nsec_pcap, int snaplen) {
     hdr.snaplen = snaplen;
     hdr.linktype = DLT_EN10MB;
 
-    fwrite(&hdr, sizeof(hdr), 1, fp);
+    if (write_exact(fp, &hdr, sizeof(hdr)) != 0) return -1;
     return sizeof(hdr);
 }
 
-unsigned write_pcap_packet(char *data, ssize_t len, struct exanic_timespecps *tsps, int nsec_pcap, int snaplen, FILE *fp) {
+int write_pcap_packet(char *data, ssize_t len, struct exanic_timespecps *tsps, int nsec_pcap, int snaplen, FILE *fp) {
     struct pcap_pkthdr hdr;
     ssize_t caplen = (len > snaplen) ? snaplen : len;
 
@@ -196,8 +219,8 @@ unsigned write_pcap_packet(char *data, ssize_t len, struct exanic_timespecps *ts
     hdr.caplen = caplen;
     hdr.len = len;
 
-    fwrite(&hdr, sizeof(hdr), 1, fp);
-    fwrite(data, 1, caplen, fp);
+    if (write_exact(fp, &hdr, sizeof(hdr)) != 0 ||
+        write_exact(fp, data, caplen) != 0) return -1;
     return sizeof(hdr) + caplen;
 }
 
@@ -213,7 +236,7 @@ struct erf_record {
     uint16_t eth_pad;
 };
 
-unsigned write_erf_packet(char *data, ssize_t len, struct exanic_timespecps *tsps, int port, int snaplen, FILE *fp) {
+int write_erf_packet(char *data, ssize_t len, struct exanic_timespecps *tsps, int port, int snaplen, FILE *fp) {
     struct erf_record hdr;
     const size_t size_hdr = 18;
 
@@ -236,14 +259,15 @@ unsigned write_erf_packet(char *data, ssize_t len, struct exanic_timespecps *tsp
     hdr.wlen = htons(len);
     hdr.eth_pad = 0;
 
-    fwrite(&hdr, size_hdr, 1, fp);
-    fwrite(data, 1, caplen, fp);
+    if (write_exact(fp, &hdr, size_hdr) != 0 ||
+        write_exact(fp, data, caplen) != 0) return -1;
     return size_hdr + caplen;
 }
 
 void print_time(struct exanic_timespecps *tsps) {
     struct tm tm;
-    localtime_r((time_t*)&tsps->tv_sec, &tm);
+    time_t seconds = tsps->tv_sec;
+    if (!localtime_r(&seconds, &tm)) return;
     printf("%04d%02d%02dT%02d%02d%02d.%012ld ",
            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
            tm.tm_hour, tm.tm_min, tm.tm_sec,
@@ -258,7 +282,7 @@ void print_hexdump(char *data, int len) {
         if ((i % 16) == 0) printf("%04x: ", i);
 
         printf("%02x", (unsigned char)data[i]);
-        if (isprint(data[i])) ascii[i%16] = data[i];
+        if (isprint((unsigned char)data[i])) ascii[i%16] = data[i];
         else ascii[i%16] = '.';
         i++;
 
@@ -270,75 +294,12 @@ void print_hexdump(char *data, int len) {
     if (rem) printf("%*.*s\n", 2*(16-rem)+((16-rem+1)/2)+rem+1, rem, ascii);
 }
 
-/* TODO: Clean up interface of this function and put into libexanic */
-ssize_t exanic_receive_frame_ex(exanic_rx_t *rx, char *rx_buf, size_t rx_buf_size, uint32_t *timestamp, int *frame_status) {
-    union {
-        struct rx_chunk_info info;
-        uint64_t data;
-    } u;
-
-    u.data = rx->buffer[rx->next_chunk].u.data;
-    if (u.info.generation == rx->generation) {
-        size_t size = 0;
-
-        /* Next expected packet */
-        while (1) {
-            const char *payload = (char *)rx->buffer[rx->next_chunk].payload;
-
-            /* Advance next_chunk to next chunk */
-            rx->next_chunk++;
-            if (rx->next_chunk == EXANIC_RX_NUM_CHUNKS) {
-                rx->next_chunk = 0;
-                rx->generation++;
-            }
-
-            /* Process current chunk */
-            if (u.info.length != 0) {
-                /* Last chunk */
-                if (size + u.info.length > rx_buf_size) {
-                    if (frame_status != NULL)
-                        *frame_status = EXANIC_RX_FRAME_TRUNCATED;
-                    return -1;
-                }
-
-                memcpy(rx_buf + size, payload, u.info.length);
-                size += u.info.length;
-
-                if (timestamp != NULL)
-                    *timestamp = u.info.timestamp;
-                if (frame_status != NULL)
-                    *frame_status = (u.info.frame_status & EXANIC_RX_FRAME_ERROR_MASK);
-                return size;
-            } else {
-                /* More chunks to come */
-                if (size + EXANIC_RX_CHUNK_PAYLOAD_SIZE <= rx_buf_size)
-                    memcpy(rx_buf + size, payload, EXANIC_RX_CHUNK_PAYLOAD_SIZE);
-                size += EXANIC_RX_CHUNK_PAYLOAD_SIZE;
-
-                /* Spin on next chunk */
-                do u.data = rx->buffer[rx->next_chunk].u.data;
-                while (u.info.generation == (uint8_t)(rx->generation - 1));
-
-                if (u.info.generation != rx->generation) {
-                    /* Got lapped? */
-                    __exanic_rx_catchup(rx);
-                    if (frame_status != NULL)
-                        *frame_status = EXANIC_RX_FRAME_SWOVFL;
-                    return -1;
-                }
-            }
-        }
-    } else if (u.info.generation == (uint8_t)(rx->generation - 1)) {
-        /* No new packet */
-        if (frame_status != NULL) *frame_status = 0;
-        return -1;
-    } else {
-        /* Got lapped? */
-        __exanic_rx_catchup(rx);
-        if (frame_status != NULL)
-            *frame_status = EXANIC_RX_FRAME_SWOVFL;
-        return -1;
-    }
+/* Use the library's post-copy overflow check and discard damaged frames. */
+ssize_t exanic_receive_frame_ex(exanic_rx_t *rx, char *buf, size_t size,
+                              uint32_t *timestamp, int *status) {
+    ssize_t n = exanic_receive_frame(rx, buf, size, timestamp);
+    *status = n < 0 ? (int)-n : EXANIC_RX_FRAME_OK;
+    return n == 0 ? -1 : n;
 }
 
 static int set_promiscuous_mode(exanic_t *exanic, int port_number, int enable) {
@@ -384,35 +345,15 @@ static int ensure_dir(const char *path)
         fprintf(stderr, "Path exists and is not a directory: %s\n", path);
         return -1;
     }
-    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
-        perror(path);
-        return -1;
+    if (mkdir(path, 0755) == -1) {
+        if (errno != EEXIST || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            perror(path);
+            return -1;
+        }
     }
     return 0;
 }
 
-// static int move_to_repo(const char *temp_path, const char *repo_dir)
-// {
-//     if (!temp_path || !*temp_path || !repo_dir || !*repo_dir) return 0;
-
-//     const char *base = strrchr(temp_path, '/');
-//     base = base ? base + 1 : temp_path;
-
-//     if (ensure_dir(repo_dir) != 0) return -1;
-
-//     char dst[4096];
-//     if (snprintf(dst, sizeof(dst), "%s/%s", repo_dir, base) >= (int)sizeof(dst)) {
-//         fprintf(stderr, "Destination path too long\n");
-//         return -1;
-//     }
-
-//     if (rename(temp_path, dst) == -1) {
-//         perror("rename (temp -> repo)");
-//         return -1;
-//     }
-//     printf("Finalizado: %s -> %s\n", temp_path, dst);
-//     return 0;
-// }
 
 static const char* path_basename(const char* path) {
     const char* slash = strrchr(path, '/');
@@ -423,6 +364,7 @@ static void path_dirname_into(const char* path, char* out, size_t out_sz) {
     const char* slash = strrchr(path, '/');
     if (!slash) { snprintf(out, out_sz, "."); return; }
     size_t len = (size_t)(slash - path);
+    if (len == 0) len = 1;
     if (len >= out_sz) len = out_sz - 1;
     memcpy(out, path, len);
     out[len] = '\0';
@@ -441,48 +383,95 @@ static void split_base_ext(const char* fname, char* base, size_t base_sz, char* 
         snprintf(ext,  ext_sz,  "%s", (fmt == FORMAT_ERF) ? "erf" : "pcap");
     }
 }
+/* Publish only a successfully closed stream. Never replace an existing capture. */
+static int finish_file_impl(FILE **fp, const char *final_name) {
+    if (!*fp) return 0;
+    FILE *stream = *fp;
+    *fp = NULL;
+    int failed = ferror(stream) != 0;
+    if (fflush(stream) != 0) { perror("capture flush"); failed = 1; }
+    if (!failed && durable && fsync(fileno(stream)) != 0) {
+        perror("capture fsync"); failed = 1;
+    }
+    if (fclose(stream) != 0) { perror("capture close"); failed = 1; }
+    if (failed) return -1;
+    if (!final_name || !*final_name) return 0;
+    char part[4101];
+    if (snprintf(part, sizeof(part), "%s.part", final_name) >= (int)sizeof(part)) return -1;
+    /* Hard linking within the same directory publishes atomically without clobbering. */
+    if (link(part, final_name) != 0) { perror("publish capture"); return -1; }
+    if (unlink(part) != 0) { perror("remove published .part"); return -1; }
+    if (durable) {
+        char dir[4096];
+        path_dirname_into(final_name, dir, sizeof(dir));
+        int fd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) { perror("open capture directory"); return -1; }
+        int rc = fsync(fd);
+        if (rc != 0) perror("directory fsync");
+        if (close(fd) != 0) { perror("directory close"); return -1; }
+        if (rc != 0) return -1;
+    }
+    fprintf(stderr, "Finalizado: %s\n", final_name);
+    return 0;
+}
+
+static int finish_file(FILE **fp, const char *final_name) {
+    int had_file = *fp != NULL;
+    int result = finish_file_impl(fp, final_name);
+    if (had_file) ptp_audit_close(&ptp, result == 0);
+    return result;
+}
+
 static int rotate_file(
-    FILE **savefp,
-    const char *savefile,
+    FILE **savefp, const char *savefile,
     char *file_name_buf, size_t file_name_buf_size,
     file_format_type file_format, int nsec_pcap, int snaplen,
-    unsigned long *file_size, int *file_no,
-    const char *repo_dir
-){
-    if (*savefp) { fclose(*savefp); *savefp = NULL; }
-
-    if (file_no) *file_no += 1;
-    const int idx = (file_no ? *file_no : 1);   
-
-    char out_dir[2048];
-    if (strchr(savefile, '/'))  path_dirname_into(savefile, out_dir, sizeof(out_dir));
-    else if (repo_dir && *repo_dir) snprintf(out_dir, sizeof(out_dir), "%s", repo_dir);
-    else snprintf(out_dir, sizeof(out_dir), ".");
-
-    if (ensure_dir(out_dir) != 0) {
-        fprintf(stderr, "Falha ao garantir diretório: %s\n", out_dir);
-        return -1;
-    }
+    unsigned long *file_size, int *file_no, const char *repo_dir
+) {
+    if (finish_file(savefp, file_name_buf) != 0) return -1;
+    char out_dir[4096];
+    if (strchr(savefile, '/')) path_dirname_into(savefile, out_dir, sizeof(out_dir));
+    else if (repo_dir && *repo_dir) {
+        if (snprintf(out_dir, sizeof(out_dir), "%s", repo_dir) >= (int)sizeof(out_dir)) {
+            fprintf(stderr, "Directory path too long\n"); return -1;
+        }
+    } else snprintf(out_dir, sizeof(out_dir), ".");
+    if (ensure_dir(out_dir) != 0) return -1;
 
     const char *fname = path_basename(savefile);
-    char base[2048], ext[32];
-    split_base_ext(fname, base, sizeof(base), ext, sizeof(ext), file_format);
-
-    if (snprintf(file_name_buf, file_name_buf_size, "%s/%s%d.%s", out_dir, base, idx, ext)
-        >= (int)file_name_buf_size) {
-        fprintf(stderr, "Filename too long\n");
-        return -1;
+    char base[4096], ext[4096], part[4101];
+    if (!*fname || strlen(fname) >= sizeof(base)) {
+        fprintf(stderr, "Invalid capture filename\n"); return -1;
     }
-
-    *savefp = fopen(file_name_buf, "wb");
-    if (!*savefp) { perror(file_name_buf); return -1; }
-
+    split_base_ext(fname, base, sizeof(base), ext, sizeof(ext), file_format);
+    for (;;) {
+        if (*file_no == INT_MAX) { fprintf(stderr, "Capture index exhausted\n"); return -1; }
+        ++*file_no;
+        if (snprintf(file_name_buf, file_name_buf_size, "%s/%s%d.%s",
+                     out_dir, base, *file_no, ext) >= (int)file_name_buf_size ||
+            snprintf(part, sizeof(part), "%s.part", file_name_buf) >= (int)sizeof(part)) {
+            fprintf(stderr, "Filename too long\n"); return -1;
+        }
+        struct stat st;
+        if (lstat(file_name_buf, &st) == 0) continue;
+        if (errno != ENOENT) { perror(file_name_buf); return -1; }
+        *savefp = fopen(part, "wbx");
+        if (*savefp) break;
+        if (errno != EEXIST) { perror(part); return -1; }
+    }
+    /* Larger buffering reduces syscall overhead; errors are checked at finalization. */
+    static char output_buffer[1024 * 1024];
+    if (setvbuf(*savefp, output_buffer, _IOFBF, sizeof(output_buffer)) != 0) {
+        fprintf(stderr, "Cannot configure capture buffering\n"); return -1;
+    }
     *file_size = 0;
     if (file_format == FORMAT_PCAP) {
-        *file_size = write_pcap_header(*savefp, nsec_pcap, snaplen);
+        int n = write_pcap_header(*savefp, nsec_pcap, snaplen);
+        if (n < 0) return -1;
+        *file_size = (unsigned long)n;
     }
-
-    printf("Capturando em: %s\n", file_name_buf);
+    fprintf(stderr, "Capturando em: %s\n", part);
+    ptp_audit_open(&ptp, file_name_buf);
     return 0;
 }
 
@@ -503,34 +492,89 @@ int main(int argc, char *argv[]) {
     struct exanic_timespecps tsps;
 
     int hw_tstamp = 0, nsec_pcap = 0, snaplen = sizeof(rx_buf), flush = 0;
-    int promisc = 1, set_promisc, filter;
+    int promisc = 1, set_promisc = 0, filter;
 
     unsigned long rx_success = 0, rx_aborted = 0, rx_corrupt = 0, rx_hwovfl = 0, rx_swovfl = 0, rx_other = 0;
     file_format_type file_format = FORMAT_PCAP;
 
     int file_no = 0;
     unsigned long file_size = 0, file_size_limit = 0;
-    char file_name_buf[4096];
+    char file_name_buf[4096] = "";
     int c;
 
     unsigned int rotate_seconds = 0;
     time_t next_rotation_time = 0;
+    unsigned long number;
     const char *repo_dir = NULL;
+    struct ptp_config ptp_config = {
+        .tai_offset = -1, .max_offset_ns = 1000, .stale_seconds = 5,
+        .expected_domain = -1,
+    };
+    int scale_given = 0, ptp_options = 0;
+    enum { OPT_PTP = 256, OPT_SCALE, OPT_TAI_OFFSET, OPT_STATUS_SOCKET,
+           OPT_MAX_OFFSET, OPT_STALE, OPT_CLOCK_ID, OPT_GM, OPT_DOMAIN, OPT_AUDIT };
+    static const struct option long_options[] = {
+        {"ptp", no_argument, NULL, OPT_PTP},
+        {"ptp-audit", required_argument, NULL, OPT_AUDIT},
+        {"hw-clock-scale", required_argument, NULL, OPT_SCALE},
+        {"tai-offset", required_argument, NULL, OPT_TAI_OFFSET},
+        {"ptp-status-socket", required_argument, NULL, OPT_STATUS_SOCKET},
+        {"ptp-max-offset-ns", required_argument, NULL, OPT_MAX_OFFSET},
+        {"ptp-stale-seconds", required_argument, NULL, OPT_STALE},
+        {"ptp-clock-id", required_argument, NULL, OPT_CLOCK_ID},
+        {"ptp-expected-gm", required_argument, NULL, OPT_GM},
+        {"ptp-domain", required_argument, NULL, OPT_DOMAIN},
+        {NULL, 0, NULL, 0},
+    };
 
-    while ((c = getopt(argc, argv, "i:w:s:C:F:pHNG:R:h?")) != -1) {
+    while ((c = getopt_long(argc, argv, "i:w:s:C:F:pHNDG:R:h?", long_options, NULL)) != -1) {
         switch (c) {
+            case OPT_PTP: ptp_config.enabled = 1; break;
+            case OPT_AUDIT:
+                if (strcmp(optarg, "on") && strcmp(optarg, "off")) goto usage_error;
+                ptp_config.disable_audit = !strcmp(optarg, "off");
+                ptp_options = 1; break;
+            case OPT_SCALE:
+                if (strcmp(optarg, "tai") && strcmp(optarg, "utc")) goto usage_error;
+                ptp_config.tai = !strcmp(optarg, "tai");
+                scale_given = ptp_options = 1; break;
+            case OPT_TAI_OFFSET:
+                if (!strcmp(optarg, "kernel")) ptp_config.tai_offset = -1;
+                else {
+                    if (parse_number(optarg, 1, 1000, &number)) goto usage_error;
+                    ptp_config.tai_offset = (int)number;
+                }
+                ptp_options = 1; break;
+            case OPT_STATUS_SOCKET: ptp_config.socket_path = optarg; ptp_options = 1; break;
+            case OPT_MAX_OFFSET:
+                if (parse_number(optarg, 0, INT_MAX, &number)) goto usage_error;
+                ptp_config.max_offset_ns = (int64_t)number; ptp_options = 1; break;
+            case OPT_STALE:
+                if (parse_number(optarg, 1, 3600, &number)) goto usage_error;
+                ptp_config.stale_seconds = (unsigned)number; ptp_options = 1; break;
+            case OPT_CLOCK_ID: ptp_config.clock_id = optarg; ptp_options = 1; break;
+            case OPT_GM: ptp_config.expected_gm = optarg; ptp_options = 1; break;
+            case OPT_DOMAIN:
+                if (parse_number(optarg, 0, 255, &number)) goto usage_error;
+                ptp_config.expected_domain = (int)number; ptp_options = 1; break;
             case 'i': interface = optarg; break;
             case 'w': savefile = optarg; break;
-            case 's': snaplen = atoi(optarg); break;
+            case 's':
+                if (parse_number(optarg, 1, sizeof(rx_buf), &number)) goto usage_error;
+                snaplen = (int)number; break;
             case 'C': /* as per tcpdump */
-                file_size_limit = 1000000L * atoi(optarg);
+                if (parse_number(optarg, 1, ULONG_MAX / 1000000UL, &number)) goto usage_error;
+                file_size_limit = 1000000UL * number;
                 break;
             case 'F': /* formats as per editcap */
                 if (strcmp(optarg, "pcap") == 0) file_format = FORMAT_PCAP;
                 else if (strcmp(optarg, "erf") == 0) file_format = FORMAT_ERF;
                 else goto usage_error;
                 break;
-            case 'G': rotate_seconds = (unsigned int)atoi(optarg); break;
+            case 'G':
+                if (parse_number(optarg, 1, INT_MAX, &number)) goto usage_error;
+                rotate_seconds = (unsigned int)number; break;
+            case 'D': durable = 1; break;
             case 'p': promisc = 0; break;
             case 'H': hw_tstamp = 1; break;
             case 'N': nsec_pcap = 1; break;
@@ -539,6 +583,13 @@ int main(int argc, char *argv[]) {
         }
     }
     if (interface == NULL) goto usage_error;
+    if (ptp_options && !ptp_config.enabled) goto usage_error;
+    if (ptp_config.enabled) {
+        if (!scale_given || (!ptp_config.tai && ptp_config.tai_offset >= 0)) goto usage_error;
+        hw_tstamp = nsec_pcap = 1;
+    }
+    if ((!savefile || strcmp(savefile, "-") == 0) &&
+        (rotate_seconds || file_size_limit || durable || repo_dir)) goto usage_error;
 
     if (exanic_find_port_by_interface_name(interface, device, 16, &port_number) != 0 &&
         parse_device_port(interface, device, &port_number) != 0) {
@@ -546,19 +597,26 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (!ptp_config.clock_id) ptp_config.clock_id = device;
+    if (ptp_clock_init(&ptp, &ptp_config)) return 1;
+
     if (savefile != NULL) {
         if (strcmp(savefile, "-") == 0) {
             savefp = stdout;
             flush = 1;
+            if (file_format == FORMAT_PCAP && write_pcap_header(savefp, nsec_pcap, snaplen) < 0)
+                goto err_acquire_handle;
         } else {
             file_name_buf[0] = '\0';
             if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
                             file_format, nsec_pcap, snaplen, &file_size, &file_no, repo_dir) != 0)
-                goto err_open_savefile;
+                goto err_acquire_handle;
 
             if (rotate_seconds > 0) {
-                time_t now = time(NULL);
-                next_rotation_time = now + rotate_seconds;
+                if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+                    perror("clock_gettime"); goto err_acquire_handle;
+                }
+                next_rotation_time = ts.tv_sec + rotate_seconds;
             }
         }
     }
@@ -568,6 +626,10 @@ int main(int argc, char *argv[]) {
     if (exanic == NULL) {
         fprintf(stderr, "%s: %s\n", device, exanic_get_last_error());
         goto err_acquire_handle;
+    }
+    if (hw_tstamp && exanic->tick_hz == 0) {
+        fprintf(stderr, "Hardware timestamp clock unavailable\n");
+        goto err_acquire_rx;
     }
 
     filter = optind < argc;
@@ -586,11 +648,15 @@ int main(int argc, char *argv[]) {
 
     set_promisc = promisc && !exanic_get_promiscuous_mode(exanic, port_number);
 
-    signal(SIGHUP, signal_handler);
-    signal(SIGINT, signal_handler);
-    signal(SIGPIPE, signal_handler);
-    signal(SIGALRM, signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction action = {0};
+    action.sa_handler = signal_handler;
+    sigemptyset(&action.sa_mask);
+    const int signals[] = {SIGHUP, SIGINT, SIGPIPE, SIGALRM, SIGTERM};
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i) {
+        if (sigaction(signals[i], &action, NULL) != 0) {
+            perror("sigaction"); goto err_apply_filters;
+        }
+    }
 
     if (set_promisc) {
         if (set_promiscuous_mode(exanic, port_number, 1) == -1)
@@ -598,7 +664,12 @@ int main(int argc, char *argv[]) {
     }
     
     /* Start reading from the rx buffer */
+    unsigned int poll_counter = 0;
     while (run) {
+        if (ptp_config.enabled && (poll_counter++ & 1023U) == 0) {
+            ptp_clock_poll(&ptp);
+            ptp_audit_event(&ptp);
+        }
         rx_size = exanic_receive_frame_ex(rx, rx_buf, sizeof(rx_buf), &timestamp, &status);
         if (rx_size < 0 && status == EXANIC_RX_FRAME_OK) continue;
 
@@ -606,18 +677,31 @@ int main(int argc, char *argv[]) {
         if (rx_size > 0 && hw_tstamp) {
             const uint64_t timestamp64 = exanic_expand_timestamp(exanic, timestamp);
             exanic_cycles_to_timespecps(exanic, timestamp64, &tsps);
+            if (ptp_config.enabled && ptp_to_utc(tsps.tv_sec, ptp.correction, &tsps.tv_sec)) {
+                fprintf(stderr, "Hardware timestamp cannot be represented as PCAP/ERF UTC\n");
+                goto err_open_next_file;
+            }
         } else {
-            clock_gettime(CLOCK_REALTIME, &ts);
+            if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+                perror("clock_gettime"); goto err_open_next_file;
+            }
             tsps.tv_sec = ts.tv_sec;
             tsps.tv_psec = ts.tv_nsec * 1000ULL;
         }
 
         if (savefp != NULL) {
             /* Log to pcap file */
-            if (rx_size > 0) {
-                if (rotate_seconds > 0) {
-                    time_t now = time(NULL);
-                    if (now >= next_rotation_time) {
+            if (rx_size > 0 && status == EXANIC_RX_FRAME_OK) {
+                size_t caplen = rx_size > snaplen ? (size_t)snaplen : (size_t)rx_size;
+                size_t record_size = (file_format == FORMAT_PCAP ? sizeof(struct pcap_pkthdr) : 18) + caplen;
+                unsigned long header_size = file_format == FORMAT_PCAP ? sizeof(struct pcap_file_header) : 0;
+                if (rotate_seconds || file_size_limit) {
+                    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+                        perror("clock_gettime"); goto err_open_next_file;
+                    }
+                    time_t now = ts.tv_sec;
+                    if (rotation_due(file_size, header_size, record_size, file_size_limit,
+                                     rotate_seconds, now, next_rotation_time)) {
                         if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
                                         file_format, nsec_pcap, snaplen, &file_size, &file_no, repo_dir) != 0)
                             goto err_open_next_file;
@@ -627,12 +711,18 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if (file_format == FORMAT_PCAP)
-                    file_size += write_pcap_packet(rx_buf, rx_size, &tsps, nsec_pcap, snaplen, savefp);
-                else if (file_format == FORMAT_ERF)
-                    file_size += write_erf_packet(rx_buf, rx_size, &tsps, port_number, snaplen, savefp);
-
-                if (flush) fflush(savefp);
+                int written = file_format == FORMAT_PCAP
+                    ? write_pcap_packet(rx_buf, rx_size, &tsps, nsec_pcap, snaplen, savefp)
+                    : write_erf_packet(rx_buf, rx_size, &tsps, port_number, snaplen, savefp);
+                if (written < 0) goto err_open_next_file;
+                if ((unsigned long)written > ULONG_MAX - file_size) {
+                    fprintf(stderr, "Capture size overflow\n"); goto err_open_next_file;
+                }
+                file_size += (unsigned long)written;
+                ptp_audit_packet(&ptp);
+                if (flush && fflush(savefp) != 0) {
+                    perror("capture flush"); goto err_open_next_file;
+                }
             }
         } else {
             /* Dump to stdout */
@@ -649,6 +739,8 @@ int main(int argc, char *argv[]) {
             } else {
                 if (status == EXANIC_RX_FRAME_ABORTED)
                     printf("sender aborted frame\n");
+                else if (status == EXANIC_RX_FRAME_CORRUPT)
+                    printf("frame discarded due to bad CRC\n");
                 else if (status == EXANIC_RX_FRAME_HWOVFL)
                     printf("frames lost due to insufficient PCIe/memory bandwidth\n");
                 else if (status == EXANIC_RX_FRAME_SWOVFL)
@@ -678,20 +770,20 @@ int main(int argc, char *argv[]) {
     exanic_release_rx_buffer(rx);
     exanic_release_handle(exanic);
 
-    if (savefp != NULL)
-        fclose(savefp);
-
-    return 0;
+    int finish_result = finish_file(&savefp, file_name_buf);
+    ptp_clock_close(&ptp);
+    return finish_result != 0;
 
 err_open_next_file:
+    if (set_promisc) set_promiscuous_mode(exanic, port_number, 0);
 err_apply_filters:
     exanic_release_rx_buffer(rx);
 err_acquire_rx:
     exanic_release_handle(exanic);
 err_acquire_handle:
-    if (savefp != NULL)
-        fclose(savefp);
-err_open_savefile:
+    ptp_clock_close(&ptp);
+    if (savefp != NULL && fclose(savefp) != 0) perror("capture close after failure");
+    if (*file_name_buf) fprintf(stderr, "Capture failed; inspect remaining .part files for %s\n", file_name_buf);
     return 1;
 
 usage_error:
@@ -707,6 +799,15 @@ usage_error:
     fprintf(stderr, " -H: use hardware timestamps (refer to documentation on how to sync clock)\n");
     fprintf(stderr, " -N: write nanosecond-resolution pcap format\n\n");
     fprintf(stderr, " -G: rotate to a new save file every N seconds (time-based rotation)\n\n");
+    fprintf(stderr, " -R: output directory when -w has no directory\n");
+    fprintf(stderr, " -D: fsync capture and directory when publishing (may delay reception)\n");
+    fprintf(stderr, " --ptp --hw-clock-scale utc|tai: hardware timestamps, nanosecond PCAP, advisory monitoring\n");
+    fprintf(stderr, " --tai-offset kernel|SECONDS: TAI-UTC correction (default: kernel, TAI input only)\n");
+    fprintf(stderr, " --ptp-status-socket PATH: local nonblocking status input (see docs/ptp.md)\n");
+    fprintf(stderr, " --ptp-audit on|off: per-file JSONL audit (default on); monitoring/warnings stay enabled\n");
+    fprintf(stderr, " --ptp-max-offset-ns N: warning threshold (default 1000 ns)\n");
+    fprintf(stderr, " --ptp-stale-seconds N: telemetry expiry (default 5 s)\n");
+    fprintf(stderr, " --ptp-clock-id ID --ptp-expected-gm ID --ptp-domain N: telemetry identity checks\n");
 
     fprintf(stderr, "Filter examples:\n");
     fprintf(stderr, " tcp port 80 (to/from tcp port 80)\n");
