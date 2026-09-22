@@ -1,24 +1,20 @@
 # Timestamp de hardware e monitoramento PTP
 
-O Timebeat continua sendo o único responsável por ajustar o relógio. O capturador
+O serviço de sincronismo configurado no host é responsável por ajustar o relógio. O capturador
 não inicia `ptp4l`, `phc2sys`, `exanic-clock-sync` nem escreve configurações de relógio.
 Não execute outro sincronizador concorrente sobre o mesmo PHC.
 
-## Configuração informada para este ambiente
+## Preparação do host
 
-- Timebeat 2.2.20 (amd64), build de 2025-06-09.
-- Fonte primária PTP na interface `enp129s0d4`, domínio **50**.
-- `adjust_clock: true`; fonte habilitada.
-- Hardware timestamping usa o padrão documentado no arquivo (habilitado).
-- `tai_offset` e `phc_offsets` estão comentados: a configuração enviada não declara
-  explicitamente a escala efetiva do PHC. Não presumir TAI apenas por receber PTP.
-- CLI SSH em loopback, porta 65129, habilitada. HTTP de status desabilitado.
-- Saída de eventos para Elasticsearch; arquivos de log operacional não equivalem
-  necessariamente a snapshots de sincronismo.
+- Identifique a interface, o dispositivo ExaNIC e o PHC usados na captura.
+- Configure a referência PTP e o domínio no serviço de sincronismo escolhido.
+- Confirme o suporte a timestamps de hardware e qual serviço disciplina cada relógio.
+- Verifique a escala efetiva do PHC (UTC ou TAI); não presuma TAI apenas por receber PTP.
+- Disponibilize telemetria do relógio capturado e valide seu formato e unidade de offset.
+  Logs operacionais não equivalem necessariamente a snapshots de sincronismo.
 
-Nenhuma credencial ou cópia integral da configuração é armazenada neste repositório.
-
-Na CLI existente, as consultas documentadas são:
+Se utilizar Timebeat, sua CLI oferece as consultas abaixo. A disponibilidade e
+o acesso dependem da versão e da configuração do serviço:
 
 ```text
 show phc devices
@@ -29,18 +25,21 @@ show ptp peers
 
 É necessário confirmar qual PHC corresponde à placa capturada. Uma outra porta
 da mesma placa pode compartilhar o relógio; outra placa não está automaticamente
-sincronizada só porque recebe tráfego no mesmo servidor. A configuração enviada
-também não habilita explicitamente `sync_nic_slaves`.
+sincronizada só porque recebe tráfego no mesmo servidor. Confirme a configuração
+de sincronismo de cada placa usada na captura.
 
 ## Captura
 
 Depois de confirmar que o PHC está em **UTC**:
 
 ```bash
-sudo ./build/exanic-capture -i enp129s0d4 -G 60 -w /tmp/captura.pcap \
-  --ptp --hw-clock-scale utc --ptp-domain 50 \
+sudo ./build/exanic-capture -i exanic0:0 -G 60 -w /tmp/captura.pcap \
+  --ptp --hw-clock-scale utc --ptp-domain 0 \
   --ptp-max-offset-ns 1000 --ptp-status-socket /run/exanic-capture-ptp.sock
 ```
+
+Dispositivo, porta, domínio e caminhos são exemplos. Substitua-os pelos valores
+do host e da rede PTP; o domínio da captura deve corresponder ao da telemetria.
 
 Se estiver em **TAI**, substitua `--hw-clock-scale utc` por
 `--hw-clock-scale tai --tai-offset kernel`. O capturador consulta `adjtimex`
@@ -77,7 +76,7 @@ Um timestamp fora do intervalo representável em PCAP/ERF também gera erro.
 
 O limite padrão é **1000 ns (1 µs)** em valor absoluto: exatamente 1000 ns é
 aceito, acima gera aviso. É configurável por `--ptp-max-offset-ns`.
-`--ptp-domain 50` confere o domínio; `--ptp-expected-gm ID` fixa opcionalmente
+`--ptp-domain N` confere o domínio configurado; `--ptp-expected-gm ID` fixa opcionalmente
 o grandmaster esperado. Sem esta opção, trocas de GM são registradas e permitidas.
 `--ptp-clock-id ID` identifica o relógio na telemetria (padrão: nome ExaNIC
 resolvido, por exemplo `exanic0`). O mapeamento do provedor deve apontar para
@@ -98,7 +97,8 @@ iniciar o processo. Com `--ptp-audit off`, nenhum arquivo de auditoria é criado
 o monitoramento, os avisos em stderr e a conversão de timestamps continuam ativos.
 Arquivos de auditoria de execuções anteriores não são apagados.
 
-Cada captura em modo PTP recebe um arquivo `captura1.pcap.ptp.jsonl` contendo:
+Com a auditoria habilitada, cada captura em modo PTP recebe um arquivo
+`captura1.pcap.ptp.jsonl` contendo:
 
 - identidade do relógio, escala declarada, origem da correção e limites;
 - amostras de sincronismo, offset, GM, domínio e correção TAI−UTC;
@@ -113,23 +113,21 @@ auditoria pode ficar incompleto. Falha na auditoria gera aviso e não para os
 pacotes. Esses metadados são observacionais, não um certificado de sincronismo.
 Com `-w -` ou saída textual, os avisos vão para stderr e não há JSONL por arquivo.
 
-## Integração do provedor (Timebeat)
+## Integração do provedor de telemetria
 
-A configuração e versão fornecidas não incluem o formato de uma resposta de
-status em execução. Por isso **não há parser presumido para o Timebeat 2.2.20**.
 O capturador aceita telemetria normalizada e há uma ponte JSON configurável em
-`tools/ptp_status_bridge.py`. Falta validar o mapeamento contra uma amostra real
-da instalação. Sem a ponte, a captura funciona, mas permanece `unknown`.
+`tools/ptp_status_bridge.py`. Não há parser nativo específico para Timebeat ou
+outro serviço: valide o mapeamento contra uma amostra real da versão instalada.
+Sem telemetria válida, a captura funciona, mas permanece `unknown`.
 
 A ponte roda em outro processo: consultas HTTP, arquivos ou timeouts não entram
 no loop de recepção. Ela aceita um snapshot JSON local (`--input-file`) ou um
 endpoint JSON verificado (`--url`). Não habilita HTTP, não reinicia serviços e
 não consulta Elasticsearch automaticamente. Se for usado o endpoint HTTP do
-Timebeat, sua ativação é uma mudança operacional separada; ele está desativado
-na configuração enviada.
+provedor, sua disponibilidade e ativação dependem da configuração desse serviço.
 
 O arquivo `--mapping` associa campos a JSON Pointers. Exemplo **sintético**
-(não corresponde a um schema confirmado do Timebeat):
+(não representa o schema de um provedor específico):
 
 ```json
 {
@@ -166,14 +164,17 @@ Depois de validar o mapeamento e a origem do snapshot:
 
 ```bash
 python3 tools/ptp_status_bridge.py \
-  --input-file /run/timebeat-clock-snapshot.json \
-  --mapping /etc/exanic-capture/timebeat-mapping.json \
+  --input-file /run/clock-snapshot.json \
+  --mapping /etc/exanic-capture/clock-mapping.json \
   --socket /run/exanic-capture-ptp.sock \
-  --clock-id exanic0 --expected-source-clock enp129s0d4
+  --clock-id exanic0 --expected-source-clock eth0
 ```
 
-O snapshot acima não é criado automaticamente pelo Timebeat nem por este
-comando: precisa ser obtido da telemetria real. Não usar exemplos estáticos como
+`exanic0` e `eth0` são exemplos: use o identificador configurado na captura e a
+identidade exata do mesmo relógio no JSON do provedor, respectivamente.
+
+O snapshot acima não é criado automaticamente por este comando: precisa ser
+obtido da telemetria real. Não usar exemplos estáticos como
 evidência de sincronismo. A ponte exige Python 3.9+ e apenas a biblioteca padrão.
 Execute-a com o mesmo usuário da captura ou root, pois o socket é privado.
 

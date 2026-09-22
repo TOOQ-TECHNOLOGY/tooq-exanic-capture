@@ -19,8 +19,11 @@ recepção de frames válidos/abortados/com CRC inválido em um buffer simulado.
 ## Uso
 
 ```bash
-sudo ./build/exanic-capture -i enp23s0 -G 60 -C 100 -w /tmp/captura.pcap
+sudo ./build/exanic-capture -i exanic0:0 -G 60 -C 100 -w /tmp/captura.pcap
 ```
+
+`exanic0:0` é um exemplo: substitua pelo dispositivo/porta ExaNIC ou pela
+interface Linux correspondente no host de captura.
 
 - `-i`: interface Linux ou porta, por exemplo `exanic0:0`.
 - `-w`: nome base de saída; `-` envia o fluxo binário para stdout.
@@ -39,9 +42,9 @@ sudo ./build/exanic-capture -i enp23s0 -G 60 -C 100 -w /tmp/captura.pcap
 - `--ptp-audit on|off`: liga/desliga somente a auditoria JSONL (padrão `on`,
   exige `--ptp`). Monitoramento e avisos em stderr continuam ativos.
 
-Veja [configuração PTP/Timebeat e auditoria por arquivo](docs/ptp.md).
+Veja [configuração PTP e auditoria por arquivo](docs/ptp.md).
 O modo PTP exige confirmar a escala do relógio. A integração de telemetria
-Timebeat depende de um mapeamento validado com a saída da instalação;
+do serviço de sincronismo depende de um mapeamento validado com sua saída;
 sem telemetria, o estado é registrado como desconhecido.
 
 As portas dos filtros são números decimais de 0 a 65535.
