@@ -538,6 +538,10 @@ int main(int argc, char *argv[]) {
             default: goto usage_error;
         }
     }
+
+    // Logando os printf em container (miguel)                                                                                                                                                   
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    
     if (interface == NULL) goto usage_error;
 
     if (exanic_find_port_by_interface_name(interface, device, 16, &port_number) != 0 &&
@@ -618,6 +622,10 @@ int main(int argc, char *argv[]) {
                 if (rotate_seconds > 0) {
                     time_t now = time(NULL);
                     if (now >= next_rotation_time) {
+                    fprintf(stderr,
+                                "%s: received=%lu corrupt=%lu aborted=%lu hw_lost=%lu sw_lost=%lu other=%lu\n",
+                                file_name_buf, rx_success, rx_corrupt, rx_aborted, rx_hwovfl, rx_swovfl, rx_other);
+
                         if (rotate_file(&savefp, savefile, file_name_buf, sizeof(file_name_buf),
                                         file_format, nsec_pcap, snaplen, &file_size, &file_no, repo_dir) != 0)
                             goto err_open_next_file;
